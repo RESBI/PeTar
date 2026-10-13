@@ -229,13 +229,13 @@ AS_IF([test x"$use_omp" != xno],
 # x86
 AC_ARG_WITH([arch],
 	    [AS_HELP_STRING([--with-arch],
-                          [compile with architecture type (x86, fugaku, tsv110). Default: x86])],
+                          [compile with architecture type (x86, fugaku, tsv110, loongarch). Default: x86])],
           [],
 	    [with_arch=x86])
 
 AC_ARG_WITH([simd],
             [AS_HELP_STRING([--with-simd],
-                [compile with x86 architecture support (avx, avx2, avx512). Default: auto])],
+                [compile with SIMD architecture support (x86: avx, avx2, avx512; loongarch: lsx, lasx). Default: auto])],
             [],
             [with_simd=auto])
 
@@ -280,6 +280,26 @@ AS_IF([test x"$with_arch" == xtsv110],
       [AX_CHECK_COMPILE_FLAG([-mcpu=tsv110],
                              [OPTFLAGS=$OPTFLAGS" -mcpu=tsv110"])
        PROG_NAME=$PROG_NAME".tsv110"])
+
+larch_simd=none
+AS_IF([test x"$with_arch" == xloongarch],
+      [AS_CASE($with_simd,
+               [lsx], [AX_CHECK_COMPILE_FLAG([-mlsx],
+                                    [SIMDFLAGS=" -mlsx"
+                                     SIMD_TYPE=lsx
+                                     larch_simd=lsx],
+                                    [AC_MSG_FAILURE([-mlsx is not supported by the compiler])])],
+               [lasx], [larch_simd=lasx],
+               [auto], [larch_simd=lasx],
+               [no], [larch_simd=none],
+               [AC_MSG_FAILURE([$with_simd is not supported for LoongArch (lsx, lasx)])])
+       AS_IF([test x"$larch_simd" == xlasx],
+             [AX_CHECK_COMPILE_FLAG([-mlasx],
+                                    [SIMDFLAGS=" -mlasx"
+                                     SIMD_TYPE=lasx],
+                                    [AC_MSG_FAILURE([-mlasx is not supported by the compiler])])])
+       AS_IF([test x"$larch_simd" != xnone],
+             [PROG_NAME=$PROG_NAME"."$larch_simd])])
 
 AC_ARG_ENABLE([64b],
               [AS_HELP_STRING([--enable-64b],
@@ -682,6 +702,7 @@ configure_date=`date '+%Y-%m-%d %H:%M:%S'`
 AC_SUBST([with_arch])
 AC_SUBST([use_simd])
 AC_SUBST([use_64b])
+AC_SUBST([larch_simd])
 AC_SUBST([use_quad])
 AC_SUBST([use_mpi])
 AC_SUBST([use_cuda])
@@ -750,6 +771,8 @@ AS_IF([test "x$use_simd" != xno],
        AS_IF([test "x$with_simd" == xauto],
              [AC_MSG_NOTICE([  Notice: this is auto-detected based on the host CPU architecture])
               AC_MSG_NOTICE([          If different CPU is used for running, check whether $SIMD_TYPE is also supported])])])
+AS_IF([test x"$larch_simd" != xnone],
+      [AC_MSG_NOTICE([     SIMD type:         LoongArch $larch_simd])])
 AC_MSG_NOTICE([     Using OpenMP:      $use_omp])
 AC_MSG_NOTICE([     Using WSL:         $build_wsl])
 AC_MSG_NOTICE([     Debug mode:        $with_debug])

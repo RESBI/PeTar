@@ -51,6 +51,9 @@
 #ifdef USE_TSV110
 #include "force_tsv110.hpp"
 #endif
+#ifdef USE_LARCH
+#include "force_larch.hpp"
+#endif
 #endif
 
 void setSpj(const PS::F64 N, SPJSoft& sp) {
@@ -126,6 +129,11 @@ int main(int argc, char **argv){
     ForceSoft force_sp_neon[Nepi];
     ForceSoft force_nb_neon[Nepi];
 #endif
+#ifdef USE_LARCH
+    ForceSoft force_larch[Nepi];
+    ForceSoft force_sp_larch[Nepi];
+    ForceSoft force_nb_larch[Nepi];
+#endif
 
     for (int i=0; i<N; i++) ptcl[i].calcRSearch(1.0/2048.0);
 
@@ -150,6 +158,11 @@ int main(int argc, char **argv){
         force_neon[i].clear();
         force_sp_neon[i].clear();
         force_nb_neon[i].clear();
+#endif
+#ifdef USE_LARCH
+        force_larch[i].clear();
+        force_sp_larch[i].clear();
+        force_nb_larch[i].clear();
 #endif
     }
     for (int i=0; i<Nepj; i++) 
@@ -281,6 +294,34 @@ int main(int argc, char **argv){
     t_nb_neon += PS::GetWtime();
 #endif
 
+#ifdef USE_LARCH
+    std::cout<<"calc Ep Ep larch\n";
+    CalcForceEpEpWithLinearCutoffLarch f_ep_ep_larch(EPISoft::eps*EPISoft::eps, EPISoft::r_out*EPISoft::r_out, ForceSoft::grav_const);
+    PS::F64 t_ep_larch=0;
+    t_ep_larch -= PS::GetWtime();
+    f_ep_ep_larch(epi, Nepi, epj, Nepj, force_larch);
+    t_ep_larch += PS::GetWtime();
+
+#ifdef USE_QUAD
+    std::cout<<"calc Ep Sp quad larch\n";
+    CalcForceEpSpQuadLarch f_ep_sp_larch(EPISoft::eps*EPISoft::eps, ForceSoft::grav_const);
+#else
+    std::cout<<"calc Ep Sp mono larch\n";
+    CalcForceEpSpMonoLarch f_ep_sp_larch(EPISoft::eps*EPISoft::eps, ForceSoft::grav_const);
+#endif
+    PS::F64 t_sp_larch=0;
+    t_sp_larch -= PS::GetWtime();
+    f_ep_sp_larch(epi, Nepi, spj, Nspj, force_sp_larch);
+    t_sp_larch += PS::GetWtime();
+
+    std::cout<<"neighbor search larch\n";
+    SearchNeighborEpEpLarch f_nb_larch;
+    PS::F64 t_nb_larch=0;
+    t_nb_larch -= PS::GetWtime();
+    f_nb_larch(epi, Nepi, epj, Nepj, force_nb_larch);
+    t_nb_larch += PS::GetWtime();
+#endif
+
     std::cout<<"calc Ep Ep\n";
     CalcForceEpEpWithLinearCutoffNoSimd f_ep_ep;
     PS::F64 t_ep_no=0;
@@ -350,6 +391,11 @@ int main(int argc, char **argv){
     PS::F64 dsmax_neon=0,dspmax_neon=0;
     PS::F64 nbcount_ave_neon=0;
 #endif
+#ifdef USE_LARCH
+    PS::F64 dfmax_larch=0,dfpmax_larch=0;
+    PS::F64 dsmax_larch=0,dspmax_larch=0;
+    PS::F64 nbcount_ave_larch=0;
+#endif
     PS::F64 df;
 
     for(int i=0; i<Nepi; i++) {
@@ -410,6 +456,15 @@ int main(int argc, char **argv){
             df=(force_sp[i].acc[j]-force_sp_neon[i].acc[j])/force_sp[i].acc[j];
             dsmax_neon = std::max(dsmax_neon, df);
             if(df>DF_MAX) std::cerr<<"Force sp diff: i="<<i<<" nosimd["<<j<<"] "<<force_sp[i].acc[j]<<" neon["<<j<<"] "<<force_sp_neon[i].acc[j]<<std::endl;
+#endif
+#ifdef USE_LARCH
+            df=(force[i].acc[j]-force_larch[i].acc[j])/force[i].acc[j];
+            dfmax_larch = std::max(dfmax_larch, df);
+            if(df>DF_MAX) std::cerr<<"Force diff: i="<<i<<" nosimd["<<j<<"] "<<force[i].acc[j]<<" larch["<<j<<"] "<<force_larch[i].acc[j]<<std::endl;
+
+            df=(force_sp[i].acc[j]-force_sp_larch[i].acc[j])/force_sp[i].acc[j];
+            dsmax_larch = std::max(dsmax_larch, df);
+            if(df>DF_MAX) std::cerr<<"Force sp diff: i="<<i<<" nosimd["<<j<<"] "<<force_sp[i].acc[j]<<" larch["<<j<<"] "<<force_sp_larch[i].acc[j]<<std::endl;
 #endif
         }
 #ifdef USE_SIMD
@@ -480,6 +535,18 @@ int main(int argc, char **argv){
         }
         nbcount_ave_neon += force_neon[i].n_ngb;
 #endif
+#ifdef USE_LARCH
+        dfpmax_larch = std::max(dfpmax_larch, (force[i].pot-force_larch[i].pot)/force[i].pot);
+        dspmax_larch = std::max(dspmax_larch, (force_sp[i].pot-force_sp_larch[i].pot)/force_sp[i].pot);
+
+        if(force[i].n_ngb!=force_larch[i].n_ngb) {
+            std::cerr<<"Neighbor diff: i="<<i<<" nosimd "<<force[i].n_ngb<<" larch "<<force_larch[i].n_ngb<<std::endl;
+        }
+        if(force_nb[i].n_ngb!=force_nb_larch[i].n_ngb) {
+            std::cerr<<"NB search diff: i="<<i<<" nosimd "<<force_nb[i].n_ngb<<" larch "<<force_nb_larch[i].n_ngb<<std::endl;
+        }
+        nbcount_ave_larch += force_larch[i].n_ngb;
+#endif
         nbcount_ave += force[i].n_ngb;
         if (force[i].n_ngb<20) nbcount[force[i].n_ngb]++;
     }
@@ -503,6 +570,13 @@ int main(int argc, char **argv){
     std::cout<<" NEON_quad";
 #else
     std::cout<<" NEON_mono";
+#endif
+#endif
+#ifdef USE_LARCH
+#ifdef USE_QUAD
+    std::cout<<" LARCH_quad";
+#else
+    std::cout<<" LARCH_mono";
 #endif
 #endif
 #ifdef USE_GPU
@@ -571,6 +645,10 @@ int main(int argc, char **argv){
     std::cout<<"NEON EP-EP diff max: "<<dfmax_neon<<" Pot diff max: "<<dfpmax_neon<<std::endl;
     std::cout<<"NEON EP-SP diff max: "<<dsmax_neon<<" Pot diff max: "<<dspmax_neon<<std::endl;
 #endif
+#ifdef USE_LARCH
+    std::cout<<"LARCH EP-EP diff max: "<<dfmax_larch<<" Pot diff max: "<<dfpmax_larch<<std::endl;
+    std::cout<<"LARCH EP-SP diff max: "<<dsmax_larch<<" Pot diff max: "<<dspmax_larch<<std::endl;
+#endif
 
     for (int i=0; i<20; i++)
       if (nbcount[i]>0) std::cout<<"NNB: "<<i<<" "<<nbcount[i]<<std::endl;
@@ -587,6 +665,9 @@ int main(int argc, char **argv){
 #endif
 #ifdef USE_TSV110
     std::cout<<" neon: "<<nbcount_ave_neon;
+#endif
+#ifdef USE_LARCH
+    std::cout<<" larch: "<<nbcount_ave_larch;
 #endif
     std::cout<<std::endl;
     
@@ -608,6 +689,11 @@ int main(int argc, char **argv){
 #ifdef USE_TSV110
     std::cout<<"Time: neon ="<<t_ep_neon<<" no="<<t_ep_no<<" ratio="<<t_ep_no/t_ep_neon<<std::endl;
     std::cout<<"Time: neon ="<<t_sp_neon<<" no="<<t_sp_no<<" ratio="<<t_sp_no/t_sp_neon<<std::endl;
+#endif
+#ifdef USE_LARCH
+    std::cout<<"Time: larch ="<<t_ep_larch<<" no="<<t_ep_no<<" ratio="<<t_ep_no/t_ep_larch<<std::endl;
+    std::cout<<"Time: larch ="<<t_sp_larch<<" no="<<t_sp_no<<" ratio="<<t_sp_no/t_sp_larch<<std::endl;
+    std::cout<<"Time: larch ="<<t_nb_larch<<" no="<<t_nb<<" ratio="<<t_nb/t_nb_larch<<std::endl;
 #endif
 
     return 0;

@@ -76,6 +76,9 @@ int MPI_Irecv(void* buffer, int count, MPI_Datatype datatype, int dest, int tag,
 #ifdef USE_TSV110
 #include "force_tsv110.hpp"
 #endif
+#ifdef USE_LARCH
+#include "force_larch.hpp"
+#endif
 #include"energy.hpp"
 #include"hard.hpp"
 #include"io.hpp"
@@ -1080,6 +1083,8 @@ public:
         tree_nb.calcForceAllAndWriteBack(SearchNeighborEpEpFugaku(), system_soft, dinfo, true, mklist_mode);
 #elif USE_TSV110
         tree_nb.calcForceAllAndWriteBack(SearchNeighborEpEpTsv110(), system_soft, dinfo, true, mklist_mode);
+#elif USE_LARCH
+        tree_nb.calcForceAllAndWriteBack(SearchNeighborEpEpLarch(), system_soft, dinfo, true, mklist_mode);
 #else
         tree_nb.calcForceAllAndWriteBack(SearchNeighborEpEpNoSimd(), system_soft, dinfo, true, mklist_mode);
 #endif
@@ -1241,6 +1246,21 @@ public:
                                            CalcForceEpSpQuadTsv110(eps2, G),
 #else // no quad
                                            CalcForceEpSpMonoTsv110(eps2, G),
+#endif // end quad
+                                           system_soft,
+                                           dinfo,
+                                           true, // clear force
+                                           mklist_mode);
+
+#elif USE_LARCH
+        PS::F64 eps2 = EPISoft::eps*EPISoft::eps;
+        PS::F64 rout2 = EPISoft::r_out*EPISoft::r_out;
+        PS::F64 G= ForceSoft::grav_const;
+        tree_soft.calcForceAllAndWriteBack(CalcForceEpEpWithLinearCutoffLarch(eps2, rout2, G),
+#ifdef USE_QUAD
+                                           CalcForceEpSpQuadLarch(eps2, G),
+#else // no quad
+                                           CalcForceEpSpMonoLarch(eps2, G),
 #endif // end quad
                                            system_soft,
                                            dinfo,
@@ -2958,6 +2978,14 @@ public:
 
 #ifdef USE_TSV110
         fout<<"Use NEON (TSV110)\n";
+#endif
+
+#ifdef USE_LARCH
+#ifdef LARCH_SIMD_LSX
+        fout<<"Use LoongArch (LSX)\n";
+#else
+        fout<<"Use LoongArch (LASX)\n";
+#endif
 #endif
 
 #ifdef PETAR_USE_MPFRC

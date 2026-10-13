@@ -356,6 +356,35 @@ CXXFLAGS += -D USE_TSV110
 endif # tsv110
 
 #-------------------------------------
+# LoongArch SIMD width: lasx (256-bit) or lsx (128-bit).
+# Default comes from configure (--with-simd=lsx|lasx); it can also be
+# switched at the make stage, e.g.
+#     make LARCH_SIMD=lsx
+# (the output file name still follows the configure-time choice; run
+# configure with --with-simd=lsx for the correctly named LSX binary)
+LARCH_SIMD ?= @larch_simd@
+
+# Reciprocal square root for the LoongArch kernels:
+#   hw (default): exact vector rsqrt instruction (xvfrsqrt.s / vfrsqrt.s)
+#   sw          : bit-magic seed + Newton step + cubic correction
+LARCH_RSQRT ?= hw
+
+ifeq ($(use_arch),loongarch)
+ifneq ($(LARCH_SIMD),none)
+ifeq ($(LARCH_SIMD),lsx)
+CXXFLAGS += -mlsx
+CXXFLAGS += -D LARCH_SIMD_LSX
+else ifeq ($(LARCH_SIMD),lasx)
+CXXFLAGS += -mlasx
+endif
+CXXFLAGS += -D USE_LARCH
+ifeq ($(LARCH_RSQRT),sw)
+CXXFLAGS += -D LARCH_RSQRT_SW
+endif
+endif # LARCH_SIMD
+endif # loongarch
+
+#-------------------------------------
 ifeq ($(use_gperf),yes)
 CXXFLAGS += @GPERFFLAGS@
 CXXFLAGS += -D GPERF_PROFILE
