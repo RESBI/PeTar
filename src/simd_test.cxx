@@ -392,8 +392,8 @@ int main(int argc, char **argv){
     PS::F64 nbcount_ave_neon=0;
 #endif
 #ifdef USE_LARCH
-    PS::F64 dfmax_larch=0,dfpmax_larch=0;
-    PS::F64 dsmax_larch=0,dspmax_larch=0;
+    PS::F64 dfmax_larch=0,dfpmax_larch=0, dfmin_larch=1e10, dfpmin_larch=1e10;
+    PS::F64 dsmax_larch=0,dspmax_larch=0, dsmin_larch=1e10, dspmin_larch=1e10;
     PS::F64 nbcount_ave_larch=0;
 #endif
     PS::F64 df;
@@ -460,11 +460,13 @@ int main(int argc, char **argv){
 #ifdef USE_LARCH
             df=(force[i].acc[j]-force_larch[i].acc[j])/force[i].acc[j];
             dfmax_larch = std::max(dfmax_larch, df);
-            if(df>DF_MAX) std::cerr<<"Force diff: i="<<i<<" nosimd["<<j<<"] "<<force[i].acc[j]<<" larch["<<j<<"] "<<force_larch[i].acc[j]<<std::endl;
+            dfmin_larch = std::min(dfmin_larch, df);
+            if(df>DF_MAX||df<-DF_MAX) std::cerr<<"Force diff: i="<<i<<" nosimd["<<j<<"] "<<force[i].acc[j]<<" larch["<<j<<"] "<<force_larch[i].acc[j]<<std::endl;
 
             df=(force_sp[i].acc[j]-force_sp_larch[i].acc[j])/force_sp[i].acc[j];
             dsmax_larch = std::max(dsmax_larch, df);
-            if(df>DF_MAX) std::cerr<<"Force sp diff: i="<<i<<" nosimd["<<j<<"] "<<force_sp[i].acc[j]<<" larch["<<j<<"] "<<force_sp_larch[i].acc[j]<<std::endl;
+            dsmin_larch = std::min(dsmin_larch, df);
+            if(df>DF_MAX||df<-DF_MAX) std::cerr<<"Force sp diff: i="<<i<<" nosimd["<<j<<"] "<<force_sp[i].acc[j]<<" larch["<<j<<"] "<<force_sp_larch[i].acc[j]<<std::endl;
 #endif
         }
 #ifdef USE_SIMD
@@ -537,7 +539,9 @@ int main(int argc, char **argv){
 #endif
 #ifdef USE_LARCH
         dfpmax_larch = std::max(dfpmax_larch, (force[i].pot-force_larch[i].pot)/force[i].pot);
+        dfpmin_larch = std::min(dfpmin_larch, (force[i].pot-force_larch[i].pot)/force[i].pot);
         dspmax_larch = std::max(dspmax_larch, (force_sp[i].pot-force_sp_larch[i].pot)/force_sp[i].pot);
+        dspmin_larch = std::min(dspmin_larch, (force_sp[i].pot-force_sp_larch[i].pot)/force_sp[i].pot);
 
         if(force[i].n_ngb!=force_larch[i].n_ngb) {
             std::cerr<<"Neighbor diff: i="<<i<<" nosimd "<<force[i].n_ngb<<" larch "<<force_larch[i].n_ngb<<std::endl;
@@ -646,8 +650,8 @@ int main(int argc, char **argv){
     std::cout<<"NEON EP-SP diff max: "<<dsmax_neon<<" Pot diff max: "<<dspmax_neon<<std::endl;
 #endif
 #ifdef USE_LARCH
-    std::cout<<"LARCH EP-EP diff max: "<<dfmax_larch<<" Pot diff max: "<<dfpmax_larch<<std::endl;
-    std::cout<<"LARCH EP-SP diff max: "<<dsmax_larch<<" Pot diff max: "<<dspmax_larch<<std::endl;
+    std::cout<<"LARCH EP-EP diff max: "<<dfmax_larch<<" min: "<<dfmin_larch<<" Pot diff max: "<<dfpmax_larch<<" min: "<<dfpmin_larch<<std::endl;
+    std::cout<<"LARCH EP-SP diff max: "<<dsmax_larch<<" min: "<<dsmin_larch<<" Pot diff max: "<<dspmax_larch<<" min: "<<dspmin_larch<<std::endl;
 #endif
 
     for (int i=0; i<20; i++)
