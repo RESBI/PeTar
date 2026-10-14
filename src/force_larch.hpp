@@ -92,6 +92,45 @@ static inline VI vrepli(const PS::S32 x){ return (VI)__lasx_xvreplgr2vr_w(x); }
 static inline VI vzeroi(){ return vrepli(0); }
 static inline VF vzerof(){ return vrepl(0.0f); }
 
+//! 4-wide LSX helpers, available in BOTH builds: the LASX build uses them
+//! for the j-remainder tail so lists only need padding to a 4-lane multiple
+//! instead of a full 8-lane block (at most 3 junk lanes per list)
+static inline __m128 l4ld(const float* p){ return (__m128)__lsx_vld(p, 0); }
+static inline __m128 l4repl(const float* p){ return (__m128)__lsx_vldrepl_w(p, 0); }
+static inline __m128 l4replv(const float x){ float v = x; return (__m128)__lsx_vldrepl_w(&v, 0); }
+static inline __m128i l4repli(const PS::S32 x){ return (__m128i)__lsx_vreplgr2vr_w(x); }
+static inline float hadd4(const __m128 v){
+    float t[4];
+    __lsx_vst((__m128i)v, t, 0);
+    return (t[0]+t[1])+(t[2]+t[3]);
+}
+static inline PS::S32 haddi4(const __m128i v){
+    PS::S32 t[4];
+    __lsx_vst(v, t, 0);
+    return (t[0]+t[1])+(t[2]+t[3]);
+}
+//! 4-wide reciprocal sqrt (hardware instruction, or the software chain when
+//! LARCH_RSQRT_SW is selected — same algorithm as rsqrt_sw)
+static inline __m128 rsqrt4(const __m128 a){
+#if defined(LARCH_RSQRT_SW) && !defined(LARCH_RSQRT_HW)
+    const int magic = 0x5f3759df;
+    __m128i ib = (__m128i)a;
+    ib = __lsx_vsub_w(l4repli(magic), __lsx_vsrli_w(ib, 1));
+    __m128 x = (__m128)ib;
+    const __m128 half = l4replv(0.5f), one = l4replv(1.0f), three = l4replv(3.0f);
+    __m128 x2 = __lsx_vfmul_s(x, x);
+    __m128 h = __lsx_vfnmsub_s(a, x2, three);
+    x = __lsx_vfmul_s(__lsx_vfmul_s(x, h), half);
+    x2 = __lsx_vfmul_s(x, x);
+    h = __lsx_vfnmsub_s(a, x2, one);
+    __m128 poly = __lsx_vfmadd_s(h, l4replv(0.375f), half);
+    poly = __lsx_vfmul_s(poly, h);
+    return __lsx_vfmadd_s(x, poly, x);
+#else
+    return (__m128)__lsx_vfrsqrt_s(a);
+#endif
+}
+
 //! horizontal sum of a float vector
 static inline float hadd(const VF v){
     float t[VW];
@@ -245,9 +284,9 @@ static inline PS::S32 compact_j_ep(const EPJSoft* epj, const PS::S32 nj, Scratch
     // pad relative to the FILTERED count (na), not nj: the mass filter can
     // drop a large fraction of the list and padding to nj would make the
     // force loops spin over junk blocks (found by profile diff: Calc_force
-    // +36% when this was based on nj); VW-lane granularity keeps at most
-    // VW-1 junk lanes per list
-    const PS::S32 npad = (na+VW-1)&~(VW-1);
+    // +36% when this was based on nj); 4-lane granularity plus the LSX tail
+    // in the I1_JV kernels keeps at most 3 junk lanes per list
+    const PS::S32 npad = (na+3)&~3;
     for(PS::S32 k=na;k<npad;k++){
         S.jx[k] = PAD_POS; S.jy[k] = PAD_POS; S.jz[k] = PAD_POS; S.jm[k] = 0.f; S.jrs[k] = 0.f;
     }
@@ -258,7 +297,7 @@ static inline PS::S32 compact_j_ep(const EPJSoft* epj, const PS::S32 nj, Scratch
 //! filter and no shift, matching the reference kernel semantics); padded to
 //! a multiple of VW + VW
 static inline PS::S32 compact_j_nb(const EPJSoft* epj, const PS::S32 nj, Scratch& S){
-    const PS::S32 npad = (nj+VW-1)&~(VW-1);
+    const PS::S32 npad = (nj+3)&~3;
     S.jx.ensure(npad); S.jy.ensure(npad); S.jz.ensure(npad); S.jm.ensure(npad); S.jrs.ensure(npad);
     for(PS::S32 j=0;j<nj;j++){
         S.jx[j] = (float)epj[j].pos.x; S.jy[j] = (float)epj[j].pos.y; S.jz[j] = (float)epj[j].pos.z;
@@ -277,7 +316,7 @@ template <class Tsp>
 static inline PS::S32 compact_j_sp(const Tsp* spj, const PS::S32 nj, Scratch& S,
                                    const PS::F64 cx, const PS::F64 cy, const PS::F64 cz,
                                    const bool quad){
-    const PS::S32 npad = (nj+VW-1)&~(VW-1);
+    const PS::S32 npad = (nj+3)&~3;
     S.jx.ensure(npad); S.jy.ensure(npad); S.jz.ensure(npad); S.jm.ensure(npad);
     if(quad){ S.qxx.ensure(npad); S.qyy.ensure(npad); S.qzz.ensure(npad); S.qxy.ensure(npad); S.qxz.ensure(npad); S.qyz.ensure(npad); }
     for(PS::S32 j=0;j<nj;j++){
@@ -361,7 +400,8 @@ struct SearchNeighborEpEpLarch{
             const VF rsi=vrepl(S.irs[ii]);
             const VF rsi2=LARCH_VMUL(rsi,rsi);
             VI nn=vzeroi();
-            for(PS::S32 j=0;j<npj;j+=VW){
+            PS::S32 j=0;
+            for(; j+VW<=npj; j+=VW){
                 const VF dx=LARCH_VSUB(xi,LARCH_VLD(&pjx[j]));
                 const VF dy=LARCH_VSUB(yi,LARCH_VLD(&pjy[j]));
                 const VF dz=LARCH_VSUB(zi,LARCH_VLD(&pjz[j]));
@@ -370,6 +410,24 @@ struct SearchNeighborEpEpLarch{
                 r2=LARCH_VMADD(dz,dz,r2);
                 const VF R2=LARCH_VMAX(rsi2,LARCH_VLD(&pjrs[j]));
                 nn=LARCH_VADDW(nn,LARCH_VAND(LARCH_VCMPLT(r2,R2),vrepli(1)));
+            }
+            // 4-wide LSX tail: j remainder without padding a full VW block
+            if(j+4<=npj){
+                const __m128 xi4=l4repl(&S.ix[ii]), yi4=l4repl(&S.iy[ii]), zi4=l4repl(&S.iz[ii]);
+                const __m128 rsi24=__lsx_vfmul_s(l4repl(&S.irs[ii]), l4repl(&S.irs[ii]));
+                __m128i nn4=l4repli(0);
+                for(; j+4<=npj; j+=4){
+                    const __m128 dx=__lsx_vfsub_s(xi4, l4ld(&pjx[j]));
+                    const __m128 dy=__lsx_vfsub_s(yi4, l4ld(&pjy[j]));
+                    const __m128 dz=__lsx_vfsub_s(zi4, l4ld(&pjz[j]));
+                    __m128 r2=__lsx_vfmadd_s(dx,dx,l4replv(0.f));
+                    r2=__lsx_vfmadd_s(dy,dy,r2);
+                    r2=__lsx_vfmadd_s(dz,dz,r2);
+                    const __m128 R2=__lsx_vfmax_s(rsi24, l4ld(&pjrs[j]));
+                    nn4=__lsx_vadd_w(nn4, __lsx_vand_v(__lsx_vfcmp_clt_s(r2,R2), l4repli(1)));
+                }
+                force[S.lst[ii]].n_ngb = haddi(nn) + haddi4(nn4);
+                continue;
             }
             force[S.lst[ii]].n_ngb = haddi(nn);
         }
@@ -508,7 +566,7 @@ struct CalcForceEpEpWithLinearCutoffLarch{
                     bp=LARCH_VSUB(bp,mr);
                 }
             }
-            for(; j<npj; j+=VW){
+            for(; j+VW<=npj; j+=VW){
                 const VF dx=LARCH_VSUB(xi,LARCH_VLD(&pjx[j]));
                 const VF dy=LARCH_VSUB(yi,LARCH_VLD(&pjy[j]));
                 const VF dz=LARCH_VSUB(zi,LARCH_VLD(&pjz[j]));
@@ -530,6 +588,41 @@ struct CalcForceEpEpWithLinearCutoffLarch{
             }
             ax=LARCH_VADD(ax,bx); ay=LARCH_VADD(ay,by);
             az=LARCH_VADD(az,bz); ap=LARCH_VADD(ap,bp);
+            // 4-wide LSX tail: j remainder without padding a full VW block
+            if(j+4<=npj){
+                const __m128 xi4=l4repl(&S.ix[ii]), yi4=l4repl(&S.iy[ii]), zi4=l4repl(&S.iz[ii]);
+                const __m128 rsi24=__lsx_vfmul_s(l4repl(&S.irs[ii]), l4repl(&S.irs[ii]));
+                const __m128 e2_4=l4replv(eps2), rc_4=l4replv(rcut2);
+                __m128 ax4=l4replv(0.f), ay4=l4replv(0.f), az4=l4replv(0.f), ap4=l4replv(0.f);
+                __m128i nn4=l4repli(0);
+                for(; j+4<=npj; j+=4){
+                    const __m128 dx=__lsx_vfsub_s(xi4, l4ld(&pjx[j]));
+                    const __m128 dy=__lsx_vfsub_s(yi4, l4ld(&pjy[j]));
+                    const __m128 dz=__lsx_vfsub_s(zi4, l4ld(&pjz[j]));
+                    const __m128 mj=l4ld(&pjm[j]);
+                    __m128 r2=__lsx_vfmadd_s(dx,dx,e2_4);
+                    r2=__lsx_vfmadd_s(dy,dy,r2);
+                    r2=__lsx_vfmadd_s(dz,dz,r2);
+                    const __m128 R2=__lsx_vfmax_s(rsi24, l4ld(&pjrs[j]));
+                    nn4=__lsx_vadd_w(nn4, __lsx_vand_v(__lsx_vfcmp_clt_s(r2,R2), l4repli(1)));
+                    const __m128 rc=__lsx_vfmax_s(__lsx_vfadd_s(r2,e2_4), rc_4);
+                    const __m128 ri=rsqrt4(rc);
+                    const __m128 ri2=__lsx_vfmul_s(ri,ri);
+                    const __m128 mr=__lsx_vfmul_s(mj,ri);
+                    const __m128 mr3=__lsx_vfmul_s(ri2,mr);
+                    ax4=__lsx_vfnmsub_s(mr3,dx,ax4);
+                    ay4=__lsx_vfnmsub_s(mr3,dy,ay4);
+                    az4=__lsx_vfnmsub_s(mr3,dz,az4);
+                    ap4=__lsx_vfsub_s(ap4,mr);
+                }
+                const PS::S32 jj=S.lst[ii];
+                force[jj].acc.x += G*(hadd(ax)+hadd4(ax4));
+                force[jj].acc.y += G*(hadd(ay)+hadd4(ay4));
+                force[jj].acc.z += G*(hadd(az)+hadd4(az4));
+                force[jj].pot   += G*(hadd(ap)+hadd4(ap4));
+                force[jj].n_ngb  = haddi(nn) + haddi4(nn4);
+                continue;
+            }
             const PS::S32 jj=S.lst[ii];
             force[jj].acc.x += G*hadd(ax);
             force[jj].acc.y += G*hadd(ay);
@@ -651,7 +744,7 @@ struct CalcForceEpSpMonoLarch{
                     bp=LARCH_VSUB(bp,mr);
                 }
             }
-            for(; j<npj; j+=VW){
+            for(; j+VW<=npj; j+=VW){
                 const VF dx=LARCH_VSUB(xi,LARCH_VLD(&pjx[j]));
                 const VF dy=LARCH_VSUB(yi,LARCH_VLD(&pjy[j]));
                 const VF dz=LARCH_VSUB(zi,LARCH_VLD(&pjz[j]));
@@ -670,6 +763,35 @@ struct CalcForceEpSpMonoLarch{
             }
             ax=LARCH_VADD(ax,bx); ay=LARCH_VADD(ay,by);
             az=LARCH_VADD(az,bz); ap=LARCH_VADD(ap,bp);
+            // 4-wide LSX tail
+            if(j+4<=npj){
+                const __m128 xi4=l4repl(&S.ix[ii]), yi4=l4repl(&S.iy[ii]), zi4=l4repl(&S.iz[ii]);
+                const __m128 e2_4=l4replv(eps2);
+                __m128 ax4=l4replv(0.f), ay4=l4replv(0.f), az4=l4replv(0.f), ap4=l4replv(0.f);
+                for(; j+4<=npj; j+=4){
+                    const __m128 dx=__lsx_vfsub_s(xi4, l4ld(&pjx[j]));
+                    const __m128 dy=__lsx_vfsub_s(yi4, l4ld(&pjy[j]));
+                    const __m128 dz=__lsx_vfsub_s(zi4, l4ld(&pjz[j]));
+                    const __m128 mj=l4ld(&pjm[j]);
+                    __m128 r2=__lsx_vfmadd_s(dx,dx,e2_4);
+                    r2=__lsx_vfmadd_s(dy,dy,r2);
+                    r2=__lsx_vfmadd_s(dz,dz,r2);
+                    const __m128 ri=rsqrt4(r2);
+                    const __m128 ri2=__lsx_vfmul_s(ri,ri);
+                    const __m128 mr=__lsx_vfmul_s(mj,ri);
+                    const __m128 mr3=__lsx_vfmul_s(ri2,mr);
+                    ax4=__lsx_vfnmsub_s(mr3,dx,ax4);
+                    ay4=__lsx_vfnmsub_s(mr3,dy,ay4);
+                    az4=__lsx_vfnmsub_s(mr3,dz,az4);
+                    ap4=__lsx_vfsub_s(ap4,mr);
+                }
+                const PS::S32 jj=S.lst[ii];
+                force[jj].acc.x += G*(hadd(ax)+hadd4(ax4));
+                force[jj].acc.y += G*(hadd(ay)+hadd4(ay4));
+                force[jj].acc.z += G*(hadd(az)+hadd4(az4));
+                force[jj].pot   += G*(hadd(ap)+hadd4(ap4));
+                continue;
+            }
             const PS::S32 jj=S.lst[ii];
             force[jj].acc.x += G*hadd(ax);
             force[jj].acc.y += G*hadd(ay);
@@ -767,7 +889,8 @@ struct CalcForceEpSpQuadLarch{
         for(PS::S32 ii=0; ii<na; ii++){
             const VF xi=vrepl(S.ix[ii]), yi=vrepl(S.iy[ii]), zi=vrepl(S.iz[ii]);
             VF ax=vzerof(), ay=vzerof(), az=vzerof(), ap=vzerof();
-            for(PS::S32 j=0;j<npj;j+=VW){
+            PS::S32 j=0;
+            for(; j+VW<=npj; j+=VW){
                 const VF dx=LARCH_VSUB(xi,LARCH_VLD(&pjx[j]));
                 const VF dy=LARCH_VSUB(yi,LARCH_VLD(&pjy[j]));
                 const VF dz=LARCH_VSUB(zi,LARCH_VLD(&pjz[j]));
@@ -795,6 +918,47 @@ struct CalcForceEpSpQuadLarch{
                 ap=LARCH_VSUB(ap,LARCH_VMUL(mj,ri));
                 ap=LARCH_VADD(ap,LARCH_VMUL(half,LARCH_VMUL(tr,ri3)));
                 ap=LARCH_VSUB(ap,qrr5);
+            }
+            // 4-wide LSX tail
+            if(j+4<=npj){
+                const __m128 xi4=l4repl(&S.ix[ii]), yi4=l4repl(&S.iy[ii]), zi4=l4repl(&S.iz[ii]);
+                const __m128 e2_4=l4replv(eps2), half4=l4replv(0.5f), five4=l4replv(5.0f), v154=l4replv(1.5f), m24=l4replv(-2.0f);
+                __m128 ax4=l4replv(0.f), ay4=l4replv(0.f), az4=l4replv(0.f), ap4=l4replv(0.f);
+                for(; j+4<=npj; j+=4){
+                    const __m128 dx=__lsx_vfsub_s(xi4, l4ld(&pjx[j]));
+                    const __m128 dy=__lsx_vfsub_s(yi4, l4ld(&pjy[j]));
+                    const __m128 dz=__lsx_vfsub_s(zi4, l4ld(&pjz[j]));
+                    const __m128 mj=l4ld(&pjm[j]);
+                    const __m128 qxx=l4ld(&pqxx[j]), qyy=l4ld(&pqyy[j]), qzz=l4ld(&pqzz[j]);
+                    const __m128 qxy=l4ld(&pqxy[j]), qxz=l4ld(&pqxz[j]), qyz=l4ld(&pqyz[j]);
+                    __m128 r2=__lsx_vfmadd_s(dx,dx,e2_4);
+                    r2=__lsx_vfmadd_s(dy,dy,r2);
+                    r2=__lsx_vfmadd_s(dz,dz,r2);
+                    const __m128 ri=rsqrt4(r2);
+                    const __m128 ri2=__lsx_vfmul_s(ri,ri);
+                    const __m128 ri3=__lsx_vfmul_s(ri2,ri);
+                    const __m128 r5=__lsx_vfmul_s(__lsx_vfmul_s(ri2,ri3),v154);
+                    const __m128 tr=__lsx_vfadd_s(__lsx_vfadd_s(qxx,qyy),qzz);
+                    const __m128 qrx=__lsx_vfmadd_s(qxz,dz,__lsx_vfmadd_s(qxy,dy,__lsx_vfmul_s(qxx,dx)));
+                    const __m128 qry=__lsx_vfmadd_s(qxy,dx,__lsx_vfmadd_s(qyz,dz,__lsx_vfmul_s(qyy,dy)));
+                    const __m128 qrz=__lsx_vfmadd_s(qyz,dy,__lsx_vfmadd_s(qxz,dx,__lsx_vfmul_s(qzz,dz)));
+                    const __m128 qrr=__lsx_vfmadd_s(qrz,dz,__lsx_vfmadd_s(qry,dy,__lsx_vfmul_s(qrx,dx)));
+                    const __m128 qrr5=__lsx_vfmul_s(r5,qrr);
+                    const __m128 qrr7=__lsx_vfmul_s(ri2,qrr5);
+                    const __m128 A=__lsx_vfadd_s(__lsx_vfsub_s(__lsx_vfmul_s(mj,ri3),__lsx_vfmul_s(tr,r5)),__lsx_vfmul_s(five4,qrr7));
+                    const __m128 m2r5=__lsx_vfmul_s(m24,r5);
+                    ax4=__lsx_vfnmsub_s(A,dx,ax4); ay4=__lsx_vfnmsub_s(A,dy,ay4); az4=__lsx_vfnmsub_s(A,dz,az4);
+                    ax4=__lsx_vfnmsub_s(m2r5,qrx,ax4); ay4=__lsx_vfnmsub_s(m2r5,qry,ay4); az4=__lsx_vfnmsub_s(m2r5,qrz,az4);
+                    ap4=__lsx_vfsub_s(ap4,__lsx_vfmul_s(mj,ri));
+                    ap4=__lsx_vfadd_s(ap4,__lsx_vfmul_s(half4,__lsx_vfmul_s(tr,ri3)));
+                    ap4=__lsx_vfsub_s(ap4,qrr5);
+                }
+                const PS::S32 jj=S.lst[ii];
+                force[jj].acc.x += G*(hadd(ax)+hadd4(ax4));
+                force[jj].acc.y += G*(hadd(ay)+hadd4(ay4));
+                force[jj].acc.z += G*(hadd(az)+hadd4(az4));
+                force[jj].pot   += G*(hadd(ap)+hadd4(ap4));
+                continue;
             }
             const PS::S32 jj=S.lst[ii];
             force[jj].acc.x += G*hadd(ax);
