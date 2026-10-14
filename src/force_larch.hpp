@@ -15,6 +15,7 @@
 
 #include <lsxintrin.h>
 #include <lasxintrin.h>
+#include <cstdlib>
 #include <vector>
 #include"soft_ptcl.hpp"
 #include"soft_force.hpp"
@@ -62,7 +63,9 @@ using VI = __m128i;   //! 4 x int32
 #define LARCH_VSRLIW(a, n)    __lsx_vsrli_w((a), (n))
 static inline VF vrepl(const float x){ return (VF)__lsx_vldrepl_w(&x, 0); }
 static inline VF vrepl_mem(const float* p){ return (VF)__lsx_vldrepl_w(p, 0); }
-static inline VI vrepli(const PS::S32 x){ return (VI)__lsx_vldrepl_w(&x, 0); }
+//! register broadcast (no stack round-trip: vldrepl from a local forces a
+//! store+load pair per call, which showed up in the hot loop's disassembly)
+static inline VI vrepli(const PS::S32 x){ return (VI)__lsx_vreplgr2vr_w(x); }
 #else
 using VF = __m256;    //! 8 x float
 using VI = __m256i;   //! 8 x int32
@@ -82,7 +85,8 @@ using VI = __m256i;   //! 8 x int32
 #define LARCH_VSRLIW(a, n)    __lasx_xvsrli_w((a), (n))
 static inline VF vrepl(const float x){ return (VF)__lasx_xvldrepl_w(&x, 0); }
 static inline VF vrepl_mem(const float* p){ return (VF)__lasx_xvldrepl_w(p, 0); }
-static inline VI vrepli(const PS::S32 x){ return (VI)__lasx_xvldrepl_w(&x, 0); }
+//! register broadcast (no stack round-trip; see the LSX note)
+static inline VI vrepli(const PS::S32 x){ return (VI)__lasx_xvreplgr2vr_w(x); }
 #endif
 
 static inline VI vzeroi(){ return vrepli(0); }
@@ -142,12 +146,54 @@ static inline VF rsqrtN(const VF a){
 }
 #endif
 
-//! per-thread scratch buffers (structure of arrays), reused across calls
+//! aligned growable raw buffer (stage-2 optimization: replaces std::vector
+//! in the hot compaction path, removing the per-element push_back
+//! branch/capacity check and the per-call clear())
+struct LarchBuf{
+    float* p = nullptr;
+    PS::S32 cap = 0;
+    LarchBuf() = default;
+    LarchBuf(const LarchBuf&) = delete;
+    LarchBuf& operator=(const LarchBuf&) = delete;
+    ~LarchBuf(){ if(p) std::free(p); }
+    void ensure(const PS::S32 n){
+        if(n<=cap) return;
+        PS::S32 nc = cap ? cap*2 : 1024;
+        while(nc<n) nc *= 2;
+        if(p) std::free(p);
+        p = (float*)std::aligned_alloc(64, (size_t)nc*sizeof(float));
+        cap = nc;
+    }
+    float  operator[](const PS::S32 i) const { return p[i]; }
+    float& operator[](const PS::S32 i)       { return p[i]; }
+};
+struct LarchBufI{
+    PS::S32* p = nullptr;
+    PS::S32 cap = 0;
+    LarchBufI() = default;
+    LarchBufI(const LarchBufI&) = delete;
+    LarchBufI& operator=(const LarchBufI&) = delete;
+    ~LarchBufI(){ if(p) std::free(p); }
+    void ensure(const PS::S32 n){
+        if(n<=cap) return;
+        PS::S32 nc = cap ? cap*2 : 1024;
+        while(nc<n) nc *= 2;
+        if(p) std::free(p);
+        p = (PS::S32*)std::aligned_alloc(64, (size_t)nc*sizeof(PS::S32));
+        cap = nc;
+    }
+    PS::S32  operator[](const PS::S32 i) const { return p[i]; }
+    PS::S32& operator[](const PS::S32 i)       { return p[i]; }
+};
+
+//! per-thread scratch buffers (structure of arrays), reused across calls;
+//! na holds the number of active i-particles after compaction
 struct Scratch{
-    std::vector<PS::S32> lst;                           //! original indices of active i
-    std::vector<float>   ix, iy, iz, irs;               //! compact i (padded to a multiple of VW)
-    std::vector<float>   jx, jy, jz, jm, jrs;           //! compact j for I1_JV
-    std::vector<float>   qxx, qyy, qzz, qxy, qxz, qyz;  //! compact super-particle quadrupole
+    LarchBufI lst;                          //! original indices of active i
+    LarchBuf  ix, iy, iz, irs;              //! compact i (padded to a multiple of VW)
+    LarchBuf  jx, jy, jz, jm, jrs;          //! compact j for I1_JV
+    LarchBuf  qxx, qyy, qzz, qxy, qxz, qyz; //! compact super-particle quadrupole
+    PS::S32   na = 0;                       //! number of active i after compaction
 };
 //! return the thread-local scratch buffer
 static inline Scratch& scratch(){
@@ -162,20 +208,22 @@ static inline Scratch& scratch(){
 static inline PS::S32 compact_i(const EPISoft* epi, const PS::S32 ni, Scratch& S,
                                 const bool shift,
                                 const PS::F64 cx, const PS::F64 cy, const PS::F64 cz){
-    S.lst.clear(); S.ix.clear(); S.iy.clear(); S.iz.clear(); S.irs.clear();
+    S.lst.ensure(ni); S.ix.ensure(ni); S.iy.ensure(ni); S.iz.ensure(ni); S.irs.ensure(ni);
+    PS::S32 na = 0;
+    const PS::F64 ox = (shift ? cx : 0.0), oy = (shift ? cy : 0.0), oz = (shift ? cz : 0.0);
     for(PS::S32 i=0;i<ni;i++){
         if(epi[i].type!=1) continue;
-        S.lst.push_back(i);
-        S.ix.push_back((float)(epi[i].pos.x - (shift ? cx : 0.0)));
-        S.iy.push_back((float)(epi[i].pos.y - (shift ? cy : 0.0)));
-        S.iz.push_back((float)(epi[i].pos.z - (shift ? cz : 0.0)));
-        const float rs = (float)epi[i].r_search;
-        S.irs.push_back(rs);
+        S.lst[na] = i;
+        S.ix[na] = (float)(epi[i].pos.x - ox);
+        S.iy[na] = (float)(epi[i].pos.y - oy);
+        S.iz[na] = (float)(epi[i].pos.z - oz);
+        S.irs[na] = (float)epi[i].r_search;
+        na++;
     }
-    const PS::S32 na = (PS::S32)S.lst.size();
+    S.na = na;
     const PS::S32 npad = (na+VW-1)/VW*VW;
     for(PS::S32 k=na;k<npad;k++){
-        S.ix.push_back(PAD_POS); S.iy.push_back(PAD_POS); S.iz.push_back(PAD_POS); S.irs.push_back(0.f);
+        S.ix[k] = PAD_POS; S.iy[k] = PAD_POS; S.iz[k] = PAD_POS; S.irs[k] = 0.f;
     }
     return npad;
 }
@@ -185,17 +233,23 @@ static inline PS::S32 compact_i(const EPISoft* epi, const PS::S32 ni, Scratch& S
 //! the x86 SIMD/Fugaku/Tsv110 kernels); padded to a multiple of VW + VW
 static inline PS::S32 compact_j_ep(const EPJSoft* epj, const PS::S32 nj, Scratch& S,
                                    const PS::F64 cx, const PS::F64 cy, const PS::F64 cz){
-    S.jx.clear(); S.jy.clear(); S.jz.clear(); S.jm.clear(); S.jrs.clear();
+    S.jx.ensure(nj); S.jy.ensure(nj); S.jz.ensure(nj); S.jm.ensure(nj); S.jrs.ensure(nj);
+    PS::S32 na = 0;
     for(PS::S32 j=0;j<nj;j++){
         if(epj[j].mass<=0.0) continue;
-        S.jx.push_back((float)(epj[j].pos.x-cx)); S.jy.push_back((float)(epj[j].pos.y-cy)); S.jz.push_back((float)(epj[j].pos.z-cz));
-        S.jm.push_back((float)epj[j].mass);
-        S.jrs.push_back((float)(epj[j].r_search*epj[j].r_search));
+        S.jx[na] = (float)(epj[j].pos.x-cx); S.jy[na] = (float)(epj[j].pos.y-cy); S.jz[na] = (float)(epj[j].pos.z-cz);
+        S.jm[na] = (float)epj[j].mass;
+        S.jrs[na] = (float)(epj[j].r_search*epj[j].r_search);
+        na++;
     }
-    const PS::S32 na = (PS::S32)S.jx.size();
-    const PS::S32 npad = (na+VW-1)/VW*VW + VW;
+    // pad relative to the FILTERED count (na), not nj: the mass filter can
+    // drop a large fraction of the list and padding to nj would make the
+    // force loops spin over junk blocks (found by profile diff: Calc_force
+    // +36% when this was based on nj); VW-lane granularity keeps at most
+    // VW-1 junk lanes per list
+    const PS::S32 npad = (na+VW-1)&~(VW-1);
     for(PS::S32 k=na;k<npad;k++){
-        S.jx.push_back(PAD_POS); S.jy.push_back(PAD_POS); S.jz.push_back(PAD_POS); S.jm.push_back(0.f); S.jrs.push_back(0.f);
+        S.jx[k] = PAD_POS; S.jy[k] = PAD_POS; S.jz[k] = PAD_POS; S.jm[k] = 0.f; S.jrs[k] = 0.f;
     }
     return npad;
 }
@@ -204,16 +258,15 @@ static inline PS::S32 compact_j_ep(const EPJSoft* epj, const PS::S32 nj, Scratch
 //! filter and no shift, matching the reference kernel semantics); padded to
 //! a multiple of VW + VW
 static inline PS::S32 compact_j_nb(const EPJSoft* epj, const PS::S32 nj, Scratch& S){
-    S.jx.clear(); S.jy.clear(); S.jz.clear(); S.jm.clear(); S.jrs.clear();
+    const PS::S32 npad = (nj+VW-1)&~(VW-1);
+    S.jx.ensure(npad); S.jy.ensure(npad); S.jz.ensure(npad); S.jm.ensure(npad); S.jrs.ensure(npad);
     for(PS::S32 j=0;j<nj;j++){
-        S.jx.push_back((float)epj[j].pos.x); S.jy.push_back((float)epj[j].pos.y); S.jz.push_back((float)epj[j].pos.z);
-        S.jm.push_back((float)epj[j].mass);
-        S.jrs.push_back((float)(epj[j].r_search*epj[j].r_search));
+        S.jx[j] = (float)epj[j].pos.x; S.jy[j] = (float)epj[j].pos.y; S.jz[j] = (float)epj[j].pos.z;
+        S.jm[j] = (float)epj[j].mass;
+        S.jrs[j] = (float)(epj[j].r_search*epj[j].r_search);
     }
-    const PS::S32 na = (PS::S32)S.jx.size();
-    const PS::S32 npad = (na+VW-1)/VW*VW + VW;
-    for(PS::S32 k=na;k<npad;k++){
-        S.jx.push_back(PAD_POS); S.jy.push_back(PAD_POS); S.jz.push_back(PAD_POS); S.jm.push_back(0.f); S.jrs.push_back(0.f);
+    for(PS::S32 j=nj;j<npad;j++){
+        S.jx[j] = PAD_POS; S.jy[j] = PAD_POS; S.jz[j] = PAD_POS; S.jm[j] = 0.f; S.jrs[j] = 0.f;
     }
     return npad;
 }
@@ -224,22 +277,22 @@ template <class Tsp>
 static inline PS::S32 compact_j_sp(const Tsp* spj, const PS::S32 nj, Scratch& S,
                                    const PS::F64 cx, const PS::F64 cy, const PS::F64 cz,
                                    const bool quad){
-    S.jx.clear(); S.jy.clear(); S.jz.clear(); S.jm.clear();
-    if(quad){ S.qxx.clear(); S.qyy.clear(); S.qzz.clear(); S.qxy.clear(); S.qxz.clear(); S.qyz.clear(); }
+    const PS::S32 npad = (nj+VW-1)&~(VW-1);
+    S.jx.ensure(npad); S.jy.ensure(npad); S.jz.ensure(npad); S.jm.ensure(npad);
+    if(quad){ S.qxx.ensure(npad); S.qyy.ensure(npad); S.qzz.ensure(npad); S.qxy.ensure(npad); S.qxz.ensure(npad); S.qyz.ensure(npad); }
     for(PS::S32 j=0;j<nj;j++){
-        S.jx.push_back((float)(spj[j].pos.x-cx)); S.jy.push_back((float)(spj[j].pos.y-cy)); S.jz.push_back((float)(spj[j].pos.z-cz));
-        S.jm.push_back((float)spj[j].mass);
+        S.jx[j] = (float)(spj[j].pos.x-cx); S.jy[j] = (float)(spj[j].pos.y-cy); S.jz[j] = (float)(spj[j].pos.z-cz);
+        S.jm[j] = (float)spj[j].mass;
         if(quad){
-            S.qxx.push_back((float)spj[j].quad.xx); S.qyy.push_back((float)spj[j].quad.yy); S.qzz.push_back((float)spj[j].quad.zz);
-            S.qxy.push_back((float)spj[j].quad.xy); S.qxz.push_back((float)spj[j].quad.xz); S.qyz.push_back((float)spj[j].quad.yz);
+            S.qxx[j] = (float)spj[j].quad.xx; S.qyy[j] = (float)spj[j].quad.yy; S.qzz[j] = (float)spj[j].quad.zz;
+            S.qxy[j] = (float)spj[j].quad.xy; S.qxz[j] = (float)spj[j].quad.xz; S.qyz[j] = (float)spj[j].quad.yz;
         }
     }
-    const PS::S32 npad = (nj+VW-1)/VW*VW + VW;
-    for(PS::S32 k=nj;k<npad;k++){
-        S.jx.push_back(PAD_POS); S.jy.push_back(PAD_POS); S.jz.push_back(PAD_POS); S.jm.push_back(0.f);
+    for(PS::S32 j=nj;j<npad;j++){
+        S.jx[j] = PAD_POS; S.jy[j] = PAD_POS; S.jz[j] = PAD_POS; S.jm[j] = 0.f;
         if(quad){
-            S.qxx.push_back(0.f); S.qyy.push_back(0.f); S.qzz.push_back(0.f);
-            S.qxy.push_back(0.f); S.qxz.push_back(0.f); S.qyz.push_back(0.f);
+            S.qxx[j] = 0.f; S.qyy[j] = 0.f; S.qzz[j] = 0.f;
+            S.qxy[j] = 0.f; S.qxz[j] = 0.f; S.qyz[j] = 0.f;
         }
     }
     return npad;
@@ -265,25 +318,27 @@ struct SearchNeighborEpEpLarch{
     void Kernel_IV_J1(const EPISoft* epi, const PS::S32 ni, const EPJSoft* epj, const PS::S32 nj, ForceSoft* force) const {
         Scratch& S = scratch();
         const PS::S32 npad = compact_i(epi,ni,S,false,0,0,0);
-        const PS::S32 na = (PS::S32)S.lst.size();
-        S.jx.resize(nj); S.jy.resize(nj); S.jz.resize(nj); S.jrs.resize(nj);
+        const PS::S32 na = S.na;
+        S.jx.ensure(nj); S.jy.ensure(nj); S.jz.ensure(nj); S.jrs.ensure(nj);
         for(PS::S32 j=0;j<nj;j++){
             S.jx[j]=(float)epj[j].pos.x; S.jy[j]=(float)epj[j].pos.y; S.jz[j]=(float)epj[j].pos.z;
             S.jrs[j]=(float)(epj[j].r_search*epj[j].r_search);
         }
+        const float* pjx = S.jx.p; const float* pjy = S.jy.p; const float* pjz = S.jz.p;
+        const float* pjrs = S.jrs.p;
         for(PS::S32 ib=0; ib<npad; ib+=VW){
             const VF xi=LARCH_VLD(&S.ix[ib]), yi=LARCH_VLD(&S.iy[ib]), zi=LARCH_VLD(&S.iz[ib]);
             const VF rsi=LARCH_VLD(&S.irs[ib]);
             const VF rsi2=LARCH_VMUL(rsi,rsi);
             VI nn=vzeroi();
             for(PS::S32 j=0;j<nj;j++){
-                const VF dx=LARCH_VSUB(xi,vrepl_mem(&S.jx[j]));
-                const VF dy=LARCH_VSUB(yi,vrepl_mem(&S.jy[j]));
-                const VF dz=LARCH_VSUB(zi,vrepl_mem(&S.jz[j]));
+                const VF dx=LARCH_VSUB(xi,vrepl_mem(&pjx[j]));
+                const VF dy=LARCH_VSUB(yi,vrepl_mem(&pjy[j]));
+                const VF dz=LARCH_VSUB(zi,vrepl_mem(&pjz[j]));
                 VF r2=LARCH_VMADD(dx,dx,vzerof());
                 r2=LARCH_VMADD(dy,dy,r2);
                 r2=LARCH_VMADD(dz,dz,r2);
-                const VF R2=LARCH_VMAX(rsi2,vrepl_mem(&S.jrs[j]));
+                const VF R2=LARCH_VMAX(rsi2,vrepl_mem(&pjrs[j]));
                 nn=LARCH_VADDW(nn,LARCH_VAND(LARCH_VCMPLT(r2,R2),vrepli(1)));
             }
             PS::S32 tmp[VW];
@@ -297,21 +352,23 @@ struct SearchNeighborEpEpLarch{
     void Kernel_I1_JV(const EPISoft* epi, const PS::S32 ni, const EPJSoft* epj, const PS::S32 nj, ForceSoft* force) const {
         Scratch& S = scratch();
         compact_i(epi,ni,S,false,0,0,0);
-        const PS::S32 na = (PS::S32)S.lst.size();
+        const PS::S32 na = S.na;
         const PS::S32 npj = compact_j_nb(epj,nj,S);
+        const float* pjx = S.jx.p; const float* pjy = S.jy.p; const float* pjz = S.jz.p;
+        const float* pjrs = S.jrs.p;
         for(PS::S32 ii=0; ii<na; ii++){
             const VF xi=vrepl(S.ix[ii]), yi=vrepl(S.iy[ii]), zi=vrepl(S.iz[ii]);
             const VF rsi=vrepl(S.irs[ii]);
             const VF rsi2=LARCH_VMUL(rsi,rsi);
             VI nn=vzeroi();
             for(PS::S32 j=0;j<npj;j+=VW){
-                const VF dx=LARCH_VSUB(xi,LARCH_VLD(&S.jx[j]));
-                const VF dy=LARCH_VSUB(yi,LARCH_VLD(&S.jy[j]));
-                const VF dz=LARCH_VSUB(zi,LARCH_VLD(&S.jz[j]));
+                const VF dx=LARCH_VSUB(xi,LARCH_VLD(&pjx[j]));
+                const VF dy=LARCH_VSUB(yi,LARCH_VLD(&pjy[j]));
+                const VF dz=LARCH_VSUB(zi,LARCH_VLD(&pjz[j]));
                 VF r2=LARCH_VMADD(dx,dx,vzerof());
                 r2=LARCH_VMADD(dy,dy,r2);
                 r2=LARCH_VMADD(dz,dz,r2);
-                const VF R2=LARCH_VMAX(rsi2,LARCH_VLD(&S.jrs[j]));
+                const VF R2=LARCH_VMAX(rsi2,LARCH_VLD(&pjrs[j]));
                 nn=LARCH_VADDW(nn,LARCH_VAND(LARCH_VCMPLT(r2,R2),vrepli(1)));
             }
             force[S.lst[ii]].n_ngb = haddi(nn);
@@ -337,8 +394,10 @@ struct CalcForceEpEpWithLinearCutoffLarch{
             if(epi[i].type==1){ cx=epi[i].pos.x; cy=epi[i].pos.y; cz=epi[i].pos.z; break; }
         }
         const PS::S32 npad = compact_i(epi,ni,S,true,cx,cy,cz);
-        const PS::S32 na = (PS::S32)S.lst.size();
+        const PS::S32 na = S.na;
         const PS::S32 nja = compact_j_ep(epj,nj,S,cx,cy,cz);
+        const float* pjx = S.jx.p; const float* pjy = S.jy.p; const float* pjz = S.jz.p;
+        const float* pjm = S.jm.p; const float* pjrs = S.jrs.p;
         const VF e2v=vrepl(eps2), rcv=vrepl(rcut2);
         for(PS::S32 ib=0; ib<npad; ib+=VW){
             const VF xi=LARCH_VLD(&S.ix[ib]), yi=LARCH_VLD(&S.iy[ib]), zi=LARCH_VLD(&S.iz[ib]);
@@ -347,14 +406,14 @@ struct CalcForceEpEpWithLinearCutoffLarch{
             VF ax=vzerof(), ay=vzerof(), az=vzerof(), ap=vzerof();
             VI nn=vzeroi();
             for(PS::S32 j=0;j<nja;j++){
-                const VF dx=LARCH_VSUB(xi,vrepl_mem(&S.jx[j]));
-                const VF dy=LARCH_VSUB(yi,vrepl_mem(&S.jy[j]));
-                const VF dz=LARCH_VSUB(zi,vrepl_mem(&S.jz[j]));
-                const VF mj=vrepl_mem(&S.jm[j]);
+                const VF dx=LARCH_VSUB(xi,vrepl_mem(&pjx[j]));
+                const VF dy=LARCH_VSUB(yi,vrepl_mem(&pjy[j]));
+                const VF dz=LARCH_VSUB(zi,vrepl_mem(&pjz[j]));
+                const VF mj=vrepl_mem(&pjm[j]);
                 VF r2=LARCH_VMADD(dx,dx,vzerof());
                 r2=LARCH_VMADD(dy,dy,r2);
                 r2=LARCH_VMADD(dz,dz,r2);
-                const VF R2=LARCH_VMAX(rsi2,vrepl_mem(&S.jrs[j]));
+                const VF R2=LARCH_VMAX(rsi2,vrepl_mem(&pjrs[j]));
                 nn=LARCH_VADDW(nn,LARCH_VAND(LARCH_VCMPLT(r2,R2),vrepli(1)));
                 const VF rc=LARCH_VMAX(LARCH_VADD(r2,e2v),rcv);
                 const VF ri=rsqrtN(rc);
@@ -386,24 +445,78 @@ struct CalcForceEpEpWithLinearCutoffLarch{
             if(epi[i].type==1){ cx=epi[i].pos.x; cy=epi[i].pos.y; cz=epi[i].pos.z; break; }
         }
         compact_i(epi,ni,S,true,cx,cy,cz);
-        const PS::S32 na = (PS::S32)S.lst.size();
+        const PS::S32 na = S.na;
         const PS::S32 npj = compact_j_ep(epj,nj,S,cx,cy,cz);
         const VF e2v=vrepl(eps2), rcv=vrepl(rcut2);
+        // hoist the raw j pointers out of the loop: the vector intrinsics
+        // carry a memory clobber, so the compiler reloads S.jx.p and friends
+        // from the Scratch object on every iteration otherwise (5 ld.d per
+        // 4-lane block in the disassembly)
+        const float* pjx = S.jx.p; const float* pjy = S.jy.p; const float* pjz = S.jz.p;
+        const float* pjm = S.jm.p; const float* pjrs = S.jrs.p;
         for(PS::S32 ii=0; ii<na; ii++){
             const VF xi=vrepl(S.ix[ii]), yi=vrepl(S.iy[ii]), zi=vrepl(S.iz[ii]);
             const VF rsi=vrepl(S.irs[ii]);
             const VF rsi2=LARCH_VMUL(rsi,rsi);
+            // split accumulators: the loop-carried accumulator updates are
+            // the serial path; two independent chains (even/odd blocks,
+            // merged once at the end) halve it while the out-of-order core
+            // overlaps the two bodies' latency chains
             VF ax=vzerof(), ay=vzerof(), az=vzerof(), ap=vzerof();
+            VF bx=vzerof(), by=vzerof(), bz=vzerof(), bp=vzerof();
             VI nn=vzeroi();
-            for(PS::S32 j=0;j<npj;j+=VW){
-                const VF dx=LARCH_VSUB(xi,LARCH_VLD(&S.jx[j]));
-                const VF dy=LARCH_VSUB(yi,LARCH_VLD(&S.jy[j]));
-                const VF dz=LARCH_VSUB(zi,LARCH_VLD(&S.jz[j]));
-                const VF mj=LARCH_VLD(&S.jm[j]);
+            PS::S32 j = 0;
+            for(; j+2*VW<=npj; j+=2*VW){
+                {
+                    const VF dx=LARCH_VSUB(xi,LARCH_VLD(&pjx[j]));
+                    const VF dy=LARCH_VSUB(yi,LARCH_VLD(&pjy[j]));
+                    const VF dz=LARCH_VSUB(zi,LARCH_VLD(&pjz[j]));
+                    const VF mj=LARCH_VLD(&pjm[j]);
+                    VF r2=LARCH_VMADD(dx,dx,vzerof());
+                    r2=LARCH_VMADD(dy,dy,r2);
+                    r2=LARCH_VMADD(dz,dz,r2);
+                    const VF R2=LARCH_VMAX(rsi2,LARCH_VLD(&pjrs[j]));
+                    nn=LARCH_VADDW(nn,LARCH_VAND(LARCH_VCMPLT(r2,R2),vrepli(1)));
+                    const VF rc=LARCH_VMAX(LARCH_VADD(r2,e2v),rcv);
+                    const VF ri=rsqrtN(rc);
+                    const VF ri2=LARCH_VMUL(ri,ri);
+                    const VF mr=LARCH_VMUL(mj,ri);
+                    const VF mr3=LARCH_VMUL(ri2,mr);
+                    ax=LARCH_VNMSUB(mr3,dx,ax);
+                    ay=LARCH_VNMSUB(mr3,dy,ay);
+                    az=LARCH_VNMSUB(mr3,dz,az);
+                    ap=LARCH_VSUB(ap,mr);
+                }
+                {
+                    const VF dx=LARCH_VSUB(xi,LARCH_VLD(&pjx[j+VW]));
+                    const VF dy=LARCH_VSUB(yi,LARCH_VLD(&pjy[j+VW]));
+                    const VF dz=LARCH_VSUB(zi,LARCH_VLD(&pjz[j+VW]));
+                    const VF mj=LARCH_VLD(&pjm[j+VW]);
+                    VF r2=LARCH_VMADD(dx,dx,vzerof());
+                    r2=LARCH_VMADD(dy,dy,r2);
+                    r2=LARCH_VMADD(dz,dz,r2);
+                    const VF R2=LARCH_VMAX(rsi2,LARCH_VLD(&pjrs[j+VW]));
+                    nn=LARCH_VADDW(nn,LARCH_VAND(LARCH_VCMPLT(r2,R2),vrepli(1)));
+                    const VF rc=LARCH_VMAX(LARCH_VADD(r2,e2v),rcv);
+                    const VF ri=rsqrtN(rc);
+                    const VF ri2=LARCH_VMUL(ri,ri);
+                    const VF mr=LARCH_VMUL(mj,ri);
+                    const VF mr3=LARCH_VMUL(ri2,mr);
+                    bx=LARCH_VNMSUB(mr3,dx,bx);
+                    by=LARCH_VNMSUB(mr3,dy,by);
+                    bz=LARCH_VNMSUB(mr3,dz,bz);
+                    bp=LARCH_VSUB(bp,mr);
+                }
+            }
+            for(; j<npj; j+=VW){
+                const VF dx=LARCH_VSUB(xi,LARCH_VLD(&pjx[j]));
+                const VF dy=LARCH_VSUB(yi,LARCH_VLD(&pjy[j]));
+                const VF dz=LARCH_VSUB(zi,LARCH_VLD(&pjz[j]));
+                const VF mj=LARCH_VLD(&pjm[j]);
                 VF r2=LARCH_VMADD(dx,dx,vzerof());
                 r2=LARCH_VMADD(dy,dy,r2);
                 r2=LARCH_VMADD(dz,dz,r2);
-                const VF R2=LARCH_VMAX(rsi2,LARCH_VLD(&S.jrs[j]));
+                const VF R2=LARCH_VMAX(rsi2,LARCH_VLD(&pjrs[j]));
                 nn=LARCH_VADDW(nn,LARCH_VAND(LARCH_VCMPLT(r2,R2),vrepli(1)));
                 const VF rc=LARCH_VMAX(LARCH_VADD(r2,e2v),rcv);
                 const VF ri=rsqrtN(rc);
@@ -415,6 +528,8 @@ struct CalcForceEpEpWithLinearCutoffLarch{
                 az=LARCH_VNMSUB(mr3,dz,az);
                 ap=LARCH_VSUB(ap,mr);
             }
+            ax=LARCH_VADD(ax,bx); ay=LARCH_VADD(ay,by);
+            az=LARCH_VADD(az,bz); ap=LARCH_VADD(ap,bp);
             const PS::S32 jj=S.lst[ii];
             force[jj].acc.x += G*hadd(ax);
             force[jj].acc.y += G*hadd(ay);
@@ -444,17 +559,19 @@ struct CalcForceEpSpMonoLarch{
             if(epi[i].type==1){ cx=epi[i].pos.x; cy=epi[i].pos.y; cz=epi[i].pos.z; break; }
         }
         const PS::S32 npad = compact_i(epi,ni,S,true,cx,cy,cz);
-        const PS::S32 na = (PS::S32)S.lst.size();
+        const PS::S32 na = S.na;
         compact_j_sp(spj,nj,S,cx,cy,cz,false);
+        const float* pjx = S.jx.p; const float* pjy = S.jy.p; const float* pjz = S.jz.p;
+        const float* pjm = S.jm.p;
         const VF e2v=vrepl(eps2);
         for(PS::S32 ib=0; ib<npad; ib+=VW){
             const VF xi=LARCH_VLD(&S.ix[ib]), yi=LARCH_VLD(&S.iy[ib]), zi=LARCH_VLD(&S.iz[ib]);
             VF ax=vzerof(), ay=vzerof(), az=vzerof(), ap=vzerof();
             for(PS::S32 j=0;j<nj;j++){
-                const VF dx=LARCH_VSUB(xi,vrepl_mem(&S.jx[j]));
-                const VF dy=LARCH_VSUB(yi,vrepl_mem(&S.jy[j]));
-                const VF dz=LARCH_VSUB(zi,vrepl_mem(&S.jz[j]));
-                const VF mj=vrepl_mem(&S.jm[j]);
+                const VF dx=LARCH_VSUB(xi,vrepl_mem(&pjx[j]));
+                const VF dy=LARCH_VSUB(yi,vrepl_mem(&pjy[j]));
+                const VF dz=LARCH_VSUB(zi,vrepl_mem(&pjz[j]));
+                const VF mj=vrepl_mem(&pjm[j]);
                 VF r2=LARCH_VMADD(dx,dx,e2v);
                 r2=LARCH_VMADD(dy,dy,r2);
                 r2=LARCH_VMADD(dz,dz,r2);
@@ -487,17 +604,58 @@ struct CalcForceEpSpMonoLarch{
             if(epi[i].type==1){ cx=epi[i].pos.x; cy=epi[i].pos.y; cz=epi[i].pos.z; break; }
         }
         compact_i(epi,ni,S,true,cx,cy,cz);
-        const PS::S32 na = (PS::S32)S.lst.size();
+        const PS::S32 na = S.na;
         const PS::S32 npj = compact_j_sp(spj,nj,S,cx,cy,cz,false);
+        const float* pjx = S.jx.p; const float* pjy = S.jy.p; const float* pjz = S.jz.p;
+        const float* pjm = S.jm.p;
         const VF e2v=vrepl(eps2);
         for(PS::S32 ii=0; ii<na; ii++){
             const VF xi=vrepl(S.ix[ii]), yi=vrepl(S.iy[ii]), zi=vrepl(S.iz[ii]);
+            // split accumulators (even/odd blocks) — see the EP-EP kernel
             VF ax=vzerof(), ay=vzerof(), az=vzerof(), ap=vzerof();
-            for(PS::S32 j=0;j<npj;j+=VW){
-                const VF dx=LARCH_VSUB(xi,LARCH_VLD(&S.jx[j]));
-                const VF dy=LARCH_VSUB(yi,LARCH_VLD(&S.jy[j]));
-                const VF dz=LARCH_VSUB(zi,LARCH_VLD(&S.jz[j]));
-                const VF mj=LARCH_VLD(&S.jm[j]);
+            VF bx=vzerof(), by=vzerof(), bz=vzerof(), bp=vzerof();
+            PS::S32 j = 0;
+            for(; j+2*VW<=npj; j+=2*VW){
+                {
+                    const VF dx=LARCH_VSUB(xi,LARCH_VLD(&pjx[j]));
+                    const VF dy=LARCH_VSUB(yi,LARCH_VLD(&pjy[j]));
+                    const VF dz=LARCH_VSUB(zi,LARCH_VLD(&pjz[j]));
+                    const VF mj=LARCH_VLD(&pjm[j]);
+                    VF r2=LARCH_VMADD(dx,dx,e2v);
+                    r2=LARCH_VMADD(dy,dy,r2);
+                    r2=LARCH_VMADD(dz,dz,r2);
+                    const VF ri=rsqrtN(r2);
+                    const VF ri2=LARCH_VMUL(ri,ri);
+                    const VF mr=LARCH_VMUL(mj,ri);
+                    const VF mr3=LARCH_VMUL(ri2,mr);
+                    ax=LARCH_VNMSUB(mr3,dx,ax);
+                    ay=LARCH_VNMSUB(mr3,dy,ay);
+                    az=LARCH_VNMSUB(mr3,dz,az);
+                    ap=LARCH_VSUB(ap,mr);
+                }
+                {
+                    const VF dx=LARCH_VSUB(xi,LARCH_VLD(&pjx[j+VW]));
+                    const VF dy=LARCH_VSUB(yi,LARCH_VLD(&pjy[j+VW]));
+                    const VF dz=LARCH_VSUB(zi,LARCH_VLD(&pjz[j+VW]));
+                    const VF mj=LARCH_VLD(&pjm[j+VW]);
+                    VF r2=LARCH_VMADD(dx,dx,e2v);
+                    r2=LARCH_VMADD(dy,dy,r2);
+                    r2=LARCH_VMADD(dz,dz,r2);
+                    const VF ri=rsqrtN(r2);
+                    const VF ri2=LARCH_VMUL(ri,ri);
+                    const VF mr=LARCH_VMUL(mj,ri);
+                    const VF mr3=LARCH_VMUL(ri2,mr);
+                    bx=LARCH_VNMSUB(mr3,dx,bx);
+                    by=LARCH_VNMSUB(mr3,dy,by);
+                    bz=LARCH_VNMSUB(mr3,dz,bz);
+                    bp=LARCH_VSUB(bp,mr);
+                }
+            }
+            for(; j<npj; j+=VW){
+                const VF dx=LARCH_VSUB(xi,LARCH_VLD(&pjx[j]));
+                const VF dy=LARCH_VSUB(yi,LARCH_VLD(&pjy[j]));
+                const VF dz=LARCH_VSUB(zi,LARCH_VLD(&pjz[j]));
+                const VF mj=LARCH_VLD(&pjm[j]);
                 VF r2=LARCH_VMADD(dx,dx,e2v);
                 r2=LARCH_VMADD(dy,dy,r2);
                 r2=LARCH_VMADD(dz,dz,r2);
@@ -510,6 +668,8 @@ struct CalcForceEpSpMonoLarch{
                 az=LARCH_VNMSUB(mr3,dz,az);
                 ap=LARCH_VSUB(ap,mr);
             }
+            ax=LARCH_VADD(ax,bx); ay=LARCH_VADD(ay,by);
+            az=LARCH_VADD(az,bz); ap=LARCH_VADD(ap,bp);
             const PS::S32 jj=S.lst[ii];
             force[jj].acc.x += G*hadd(ax);
             force[jj].acc.y += G*hadd(ay);
@@ -538,19 +698,23 @@ struct CalcForceEpSpQuadLarch{
             if(epi[i].type==1){ cx=epi[i].pos.x; cy=epi[i].pos.y; cz=epi[i].pos.z; break; }
         }
         const PS::S32 npad = compact_i(epi,ni,S,true,cx,cy,cz);
-        const PS::S32 na = (PS::S32)S.lst.size();
+        const PS::S32 na = S.na;
         compact_j_sp(spj,nj,S,cx,cy,cz,true);
+        const float* pjx = S.jx.p; const float* pjy = S.jy.p; const float* pjz = S.jz.p;
+        const float* pjm = S.jm.p;
+        const float* pqxx = S.qxx.p; const float* pqyy = S.qyy.p; const float* pqzz = S.qzz.p;
+        const float* pqxy = S.qxy.p; const float* pqxz = S.qxz.p; const float* pqyz = S.qyz.p;
         const VF e2v=vrepl(eps2), half=vrepl(0.5f), five=vrepl(5.0f), v15=vrepl(1.5f), m2=vrepl(-2.0f);
         for(PS::S32 ib=0; ib<npad; ib+=VW){
             const VF xi=LARCH_VLD(&S.ix[ib]), yi=LARCH_VLD(&S.iy[ib]), zi=LARCH_VLD(&S.iz[ib]);
             VF ax=vzerof(), ay=vzerof(), az=vzerof(), ap=vzerof();
             for(PS::S32 j=0;j<nj;j++){
-                const VF dx=LARCH_VSUB(xi,vrepl_mem(&S.jx[j]));
-                const VF dy=LARCH_VSUB(yi,vrepl_mem(&S.jy[j]));
-                const VF dz=LARCH_VSUB(zi,vrepl_mem(&S.jz[j]));
-                const VF mj=vrepl_mem(&S.jm[j]);
-                const VF qxx=vrepl_mem(&S.qxx[j]), qyy=vrepl_mem(&S.qyy[j]), qzz=vrepl_mem(&S.qzz[j]);
-                const VF qxy=vrepl_mem(&S.qxy[j]), qxz=vrepl_mem(&S.qxz[j]), qyz=vrepl_mem(&S.qyz[j]);
+                const VF dx=LARCH_VSUB(xi,vrepl_mem(&pjx[j]));
+                const VF dy=LARCH_VSUB(yi,vrepl_mem(&pjy[j]));
+                const VF dz=LARCH_VSUB(zi,vrepl_mem(&pjz[j]));
+                const VF mj=vrepl_mem(&pjm[j]);
+                const VF qxx=vrepl_mem(&pqxx[j]), qyy=vrepl_mem(&pqyy[j]), qzz=vrepl_mem(&pqzz[j]);
+                const VF qxy=vrepl_mem(&pqxy[j]), qxz=vrepl_mem(&pqxz[j]), qyz=vrepl_mem(&pqyz[j]);
                 VF r2=LARCH_VMADD(dx,dx,e2v);
                 r2=LARCH_VMADD(dy,dy,r2);
                 r2=LARCH_VMADD(dz,dz,r2);
@@ -593,19 +757,23 @@ struct CalcForceEpSpQuadLarch{
             if(epi[i].type==1){ cx=epi[i].pos.x; cy=epi[i].pos.y; cz=epi[i].pos.z; break; }
         }
         compact_i(epi,ni,S,true,cx,cy,cz);
-        const PS::S32 na = (PS::S32)S.lst.size();
+        const PS::S32 na = S.na;
         const PS::S32 npj = compact_j_sp(spj,nj,S,cx,cy,cz,true);
+        const float* pjx = S.jx.p; const float* pjy = S.jy.p; const float* pjz = S.jz.p;
+        const float* pjm = S.jm.p;
+        const float* pqxx = S.qxx.p; const float* pqyy = S.qyy.p; const float* pqzz = S.qzz.p;
+        const float* pqxy = S.qxy.p; const float* pqxz = S.qxz.p; const float* pqyz = S.qyz.p;
         const VF e2v=vrepl(eps2), half=vrepl(0.5f), five=vrepl(5.0f), v15=vrepl(1.5f), m2=vrepl(-2.0f);
         for(PS::S32 ii=0; ii<na; ii++){
             const VF xi=vrepl(S.ix[ii]), yi=vrepl(S.iy[ii]), zi=vrepl(S.iz[ii]);
             VF ax=vzerof(), ay=vzerof(), az=vzerof(), ap=vzerof();
             for(PS::S32 j=0;j<npj;j+=VW){
-                const VF dx=LARCH_VSUB(xi,LARCH_VLD(&S.jx[j]));
-                const VF dy=LARCH_VSUB(yi,LARCH_VLD(&S.jy[j]));
-                const VF dz=LARCH_VSUB(zi,LARCH_VLD(&S.jz[j]));
-                const VF mj=LARCH_VLD(&S.jm[j]);
-                const VF qxx=LARCH_VLD(&S.qxx[j]), qyy=LARCH_VLD(&S.qyy[j]), qzz=LARCH_VLD(&S.qzz[j]);
-                const VF qxy=LARCH_VLD(&S.qxy[j]), qxz=LARCH_VLD(&S.qxz[j]), qyz=LARCH_VLD(&S.qyz[j]);
+                const VF dx=LARCH_VSUB(xi,LARCH_VLD(&pjx[j]));
+                const VF dy=LARCH_VSUB(yi,LARCH_VLD(&pjy[j]));
+                const VF dz=LARCH_VSUB(zi,LARCH_VLD(&pjz[j]));
+                const VF mj=LARCH_VLD(&pjm[j]);
+                const VF qxx=LARCH_VLD(&pqxx[j]), qyy=LARCH_VLD(&pqyy[j]), qzz=LARCH_VLD(&pqzz[j]);
+                const VF qxy=LARCH_VLD(&pqxy[j]), qxz=LARCH_VLD(&pqxz[j]), qyz=LARCH_VLD(&pqyz[j]);
                 VF r2=LARCH_VMADD(dx,dx,e2v);
                 r2=LARCH_VMADD(dy,dy,r2);
                 r2=LARCH_VMADD(dz,dz,r2);
